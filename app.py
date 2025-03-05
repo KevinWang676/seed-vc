@@ -26,6 +26,13 @@ from modules.commons import *
 from modules.commons import str2bool
 from hf_utils import load_custom_model_from_hf
 
+import torch.multiprocessing as mp
+from fastapi.concurrency import BackgroundTasks
+import threading
+
+# Global lock for GPU operations
+gpu_lock = threading.Lock()
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Voice Conversion API", 
@@ -312,33 +319,35 @@ def load_models(f0_condition=False, checkpoint_path=None, config_path=None, fp16
 async def process_voice_conversion(source_path, target_path, output_path, params):
     global models, device
     
-    if models is None:
-        raise ValueError("Models not loaded")
+    # Acquire GPU lock to prevent multiple concurrent GPU operations
+    with gpu_lock:
+        if models is None:
+            raise ValueError("Models not loaded")
+            
+        model, semantic_fn, f0_fn, vocoder_fn, campplus_model, mel_fn, mel_fn_args = models
         
-    model, semantic_fn, f0_fn, vocoder_fn, campplus_model, mel_fn, mel_fn_args = models
-    
-    # Check that f0_fn is available if f0_condition is True
-    if params.f0_condition and f0_fn is None:
-        raise ValueError("f0_condition is True but f0 extractor was not loaded. Please reload models with f0_condition=True")
-    
-    sr = mel_fn_args['sampling_rate']
-    f0_condition = params.f0_condition
-    auto_f0_adjust = params.auto_f0_adjust
-    pitch_shift = params.semi_tone_shift
-    diffusion_steps = params.diffusion_steps
-    length_adjust = params.length_adjust
-    inference_cfg_rate = params.inference_cfg_rate
-    
-    print(f"Loading audio files with sampling rate {sr}")
-    # Load audio files
-    try:
-        source_audio = librosa.load(source_path, sr=sr)[0]
-        print(f"Source audio loaded, length: {len(source_audio)}")
-        ref_audio = librosa.load(target_path, sr=sr)[0]
-        print(f"Target audio loaded, length: {len(ref_audio)}")
-    except Exception as e:
-        print(f"Error loading audio files: {e}")
-        raise
+        # Check that f0_fn is available if f0_condition is True
+        if params.f0_condition and f0_fn is None:
+            raise ValueError("f0_condition is True but f0 extractor was not loaded. Please reload models with f0_condition=True")
+        
+        sr = mel_fn_args['sampling_rate']
+        f0_condition = params.f0_condition
+        auto_f0_adjust = params.auto_f0_adjust
+        pitch_shift = params.semi_tone_shift
+        diffusion_steps = params.diffusion_steps
+        length_adjust = params.length_adjust
+        inference_cfg_rate = params.inference_cfg_rate
+        
+        print(f"Loading audio files with sampling rate {sr}")
+        # Load audio files
+        try:
+            source_audio = librosa.load(source_path, sr=sr)[0]
+            print(f"Source audio loaded, length: {len(source_audio)}")
+            ref_audio = librosa.load(target_path, sr=sr)[0]
+            print(f"Target audio loaded, length: {len(ref_audio)}")
+        except Exception as e:
+            print(f"Error loading audio files: {e}")
+            raise
 
     sr = 22050 if not f0_condition else 44100
     hop_length = 256 if not f0_condition else 512
@@ -509,6 +518,10 @@ async def process_voice_conversion(source_path, target_path, output_path, params
     time_vc_end = time.time()
     rtf = (time_vc_end - time_vc_start) / vc_wave.size(-1) * sr
     
+    # Clean up GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     # Save the output file
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     torchaudio.save(output_path, vc_wave.cpu(), sr)
