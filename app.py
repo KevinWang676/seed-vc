@@ -509,10 +509,6 @@ async def process_voice_conversion(source_path, target_path, output_path, params
     time_vc_end = time.time()
     rtf = (time_vc_end - time_vc_start) / vc_wave.size(-1) * sr
     
-    # Clean up GPU memory
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        
     # Save the output file
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     torchaudio.save(output_path, vc_wave.cpu(), sr)
