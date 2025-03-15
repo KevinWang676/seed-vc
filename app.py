@@ -544,6 +544,11 @@ async def process_voice_conversion(source_path, target_path, output_path, params
     processed_frames = 0
     generated_wave_chunks = []
     # generate chunk by chunk and stream the output
+    processed_frames = 0
+    generated_wave_chunks = []
+    
+    print(f"Processing audio in chunks, f0_condition={f0_condition}")
+    
     while processed_frames < cond.size(1):
         with torch.no_grad():
             chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
@@ -570,37 +575,91 @@ async def process_voice_conversion(source_path, target_path, output_path, params
                 
                 # Different handling based on f0_condition
                 if not f0_condition:
-                    # For f0_condition=False use direct indexing as per reference code
+                    # For f0_condition=False, handle like the reference code
                     vc_wave = vocoder_fn(vc_target.float())[0]
+                    
+                    # Print shape for debugging
+                    print(f"f0_condition=False, vc_wave shape: {vc_wave.shape}")
+                    
+                    # Process like reference code
+                    if processed_frames == 0:
+                        if is_last_chunk:
+                            # Single chunk case
+                            output_wave = vc_wave.cpu().numpy()
+                            generated_wave_chunks.append(output_wave)
+                            break
+                        # First of multiple chunks
+                        output_wave = vc_wave[:-overlap_wave_len].cpu().numpy()
+                        generated_wave_chunks.append(output_wave)
+                        previous_chunk = vc_wave[-overlap_wave_len:].cpu()
+                    elif is_last_chunk:
+                        # Last chunk
+                        output_wave = crossfade(previous_chunk.numpy(), vc_wave.cpu().numpy(), overlap_wave_len)
+                        generated_wave_chunks.append(output_wave)
+                        break
+                    else:
+                        # Middle chunk
+                        output_wave = crossfade(previous_chunk.numpy(), vc_wave[:-overlap_wave_len].cpu().numpy(), overlap_wave_len)
+                        generated_wave_chunks.append(output_wave)
+                        previous_chunk = vc_wave[-overlap_wave_len:].cpu()
                 else:
-                    # For f0_condition=True use squeeze as in original code
+                    # For f0_condition=True, use the original code's approach
                     vc_wave = vocoder_fn(vc_target.float()).squeeze()
                     vc_wave = vc_wave[None, :]
                     
-        with torch.no_grad():
-            if processed_frames == 0:
-                if is_last_chunk:
-                    output_wave = vc_wave.cpu().numpy()
-                    generated_wave_chunks.append(output_wave)
-                    break
-                output_wave = vc_wave[:-overlap_wave_len].cpu().numpy()
-                generated_wave_chunks.append(output_wave)
-                previous_chunk = vc_wave[-overlap_wave_len:].cpu()
-                processed_frames += vc_target.size(2) - overlap_frame_len
-            elif is_last_chunk:
-                output_wave = crossfade(previous_chunk.numpy(), vc_wave.cpu().numpy(), overlap_wave_len)
-                generated_wave_chunks.append(output_wave)
-                processed_frames += vc_target.size(2) - overlap_frame_len
-                break
-            else:
-                output_wave = crossfade(previous_chunk.numpy(), vc_wave[:-overlap_wave_len].cpu().numpy(),
-                                    overlap_wave_len)
-                generated_wave_chunks.append(output_wave)
-                previous_chunk = vc_wave[-overlap_wave_len:].cpu()
-                processed_frames += vc_target.size(2) - overlap_frame_len
+                    # Print shape for debugging
+                    print(f"f0_condition=True, vc_wave shape: {vc_wave.shape}")
+                    
+                    if processed_frames == 0:
+                        if is_last_chunk:
+                            # Single chunk case
+                            output_wave = vc_wave[0].cpu().numpy()
+                            generated_wave_chunks.append(output_wave)
+                            break
+                        # First of multiple chunks
+                        output_wave = vc_wave[0, :-overlap_wave_len].cpu().numpy()
+                        generated_wave_chunks.append(output_wave)
+                        previous_chunk = vc_wave[0, -overlap_wave_len:].cpu()
+                    elif is_last_chunk:
+                        # Last chunk
+                        output_wave = crossfade(previous_chunk.numpy(), vc_wave[0].cpu().numpy(), overlap_wave_len)
+                        generated_wave_chunks.append(output_wave)
+                        break
+                    else:
+                        # Middle chunk
+                        output_wave = crossfade(previous_chunk.numpy(), vc_wave[0, :-overlap_wave_len].cpu().numpy(), overlap_wave_len)
+                        generated_wave_chunks.append(output_wave)
+                        previous_chunk = vc_wave[0, -overlap_wave_len:].cpu()
+        
+        # Increment processed frames for next chunk
+        processed_frames += vc_target.size(2) - overlap_frame_len
+        print(f"Processed {processed_frames}/{cond.size(1)} frames")
     
     # Concatenate waves and convert to tensor
-    vc_wave = torch.tensor(np.concatenate(generated_wave_chunks))[None, :].float()
+    # Concatenate waves 
+    concatenated_audio = np.concatenate(generated_wave_chunks)
+    
+    # Ensure proper dimensionality for saving - torchaudio requires [channels, samples]
+    # Check shape of concatenated audio
+    print(f"Shape of concatenated audio: {concatenated_audio.shape}")
+    
+    if len(concatenated_audio.shape) == 1:
+        # If 1D (samples only), add channel dimension
+        vc_wave = torch.tensor(concatenated_audio).unsqueeze(0).float()
+    elif len(concatenated_audio.shape) == 2:
+        # If already 2D, ensure it's [channels, samples] not [samples, channels]
+        if concatenated_audio.shape[0] < concatenated_audio.shape[1]:  # More samples than channels
+            vc_wave = torch.tensor(concatenated_audio).float()
+        else:  # Possibly transposed
+            vc_wave = torch.tensor(concatenated_audio.T).float()
+    else:
+        # If more dimensions, reshape appropriately
+        print(f"Warning: Unexpected audio shape: {concatenated_audio.shape}, reshaping")
+        # Try to flatten to [1, samples]
+        vc_wave = torch.tensor(concatenated_audio.reshape(-1)).unsqueeze(0).float()
+    
+    print(f"Final tensor shape for saving: {vc_wave.shape}")
+    
     time_vc_end = time.time()
     rtf = (time_vc_end - time_vc_start) / vc_wave.size(-1) * sr
     
@@ -610,7 +669,7 @@ async def process_voice_conversion(source_path, target_path, output_path, params
         
     # Save the output file
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    torchaudio.save(output_path, vc_wave.cpu(), sr)
+    torchaudio.save(output_path, vc_wave, sr)
     
     return {"output_path": output_path, "rtf": rtf}
 
