@@ -309,7 +309,6 @@ def load_models(f0_condition=False, checkpoint_path=None, config_path=None, fp16
     )
 
 # Voice conversion function
-# Updated process_voice_conversion function with fixed sample rate handling
 async def process_voice_conversion(source_path, target_path, output_path, params):
     global models, device
     
@@ -322,8 +321,7 @@ async def process_voice_conversion(source_path, target_path, output_path, params
     if params.f0_condition and f0_fn is None:
         raise ValueError("f0_condition is True but f0 extractor was not loaded. Please reload models with f0_condition=True")
     
-    # Get initial sample rate from mel_fn_args
-    initial_sr = mel_fn_args['sampling_rate']
+    sr = mel_fn_args['sampling_rate']
     f0_condition = params.f0_condition
     auto_f0_adjust = params.auto_f0_adjust
     pitch_shift = params.semi_tone_shift
@@ -331,43 +329,33 @@ async def process_voice_conversion(source_path, target_path, output_path, params
     length_adjust = params.length_adjust
     inference_cfg_rate = params.inference_cfg_rate
     
-    print(f"Loading audio files with initial sample rate {initial_sr}")
+    print(f"Loading audio files with sampling rate {sr}")
     # Load audio files
     try:
-        source_audio = librosa.load(source_path, sr=initial_sr)[0]
+        source_audio = librosa.load(source_path, sr=sr)[0]
         print(f"Source audio loaded, length: {len(source_audio)}")
-        ref_audio = librosa.load(target_path, sr=initial_sr)[0]
+        ref_audio = librosa.load(target_path, sr=sr)[0]
         print(f"Target audio loaded, length: {len(ref_audio)}")
     except Exception as e:
         print(f"Error loading audio files: {e}")
         raise
 
-    # Determine processing sample rate based on f0_condition
-    processing_sr = 22050 if not f0_condition else 44100
-    print(f"Setting processing sample rate to {processing_sr} Hz based on f0_condition={f0_condition}")
-    
+    sr = 22050 if not f0_condition else 44100
     hop_length = 256 if not f0_condition else 512
-    max_context_window = processing_sr // hop_length * 30
+    max_context_window = sr // hop_length * 30
     overlap_frame_len = 16
     overlap_wave_len = overlap_frame_len * hop_length
 
     # Process audio
     with torch.no_grad():
         source_audio = torch.tensor(source_audio).unsqueeze(0).float().to(device)
-        ref_audio = torch.tensor(ref_audio[:initial_sr * 25]).unsqueeze(0).float().to(device)
-        
-        # If initial_sr is different from processing_sr, resample here
-        if initial_sr != processing_sr:
-            print(f"Resampling from {initial_sr} Hz to {processing_sr} Hz for processing")
-            source_audio = torchaudio.functional.resample(source_audio, initial_sr, processing_sr)
-            ref_audio = torchaudio.functional.resample(ref_audio, initial_sr, processing_sr)
+        ref_audio = torch.tensor(ref_audio[:sr * 25]).unsqueeze(0).float().to(device)
 
     time_vc_start = time.time()
-    # Resample to 16kHz for feature extraction
+    # Resample
     with torch.no_grad():
-        converted_waves_16k = torchaudio.functional.resample(source_audio, processing_sr, 16000)
-        
-    # If source audio less than 30 seconds, whisper can handle in one forward
+        converted_waves_16k = torchaudio.functional.resample(source_audio, sr, 16000)
+    # if source audio less than 30 seconds, whisper can handle in one forward
     with torch.no_grad():
         if converted_waves_16k.size(-1) <= 16000 * 30:
             S_alt = semantic_fn(converted_waves_16k)
@@ -392,7 +380,7 @@ async def process_voice_conversion(source_path, target_path, output_path, params
                 traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
             S_alt = torch.cat(S_alt_list, dim=1)
 
-        ori_waves_16k = torchaudio.functional.resample(ref_audio, processing_sr, 16000)
+        ori_waves_16k = torchaudio.functional.resample(ref_audio, sr, 16000)
         S_ori = semantic_fn(ori_waves_16k)
 
     with torch.no_grad():
@@ -517,24 +505,20 @@ async def process_voice_conversion(source_path, target_path, output_path, params
                 previous_chunk = vc_wave[0, -overlap_wave_len:].cpu()
                 processed_frames += vc_target.size(2) - overlap_frame_len
     
-    # Combine audio chunks
     vc_wave = torch.tensor(np.concatenate(generated_wave_chunks))[None, :].float()
     time_vc_end = time.time()
-    rtf = (time_vc_end - time_vc_start) / vc_wave.size(-1) * processing_sr
+    rtf = (time_vc_end - time_vc_start) / vc_wave.size(-1) * sr
     
     # Clean up GPU memory
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         
-    print(f"Output wave shape: {vc_wave.shape}, sample rate: {processing_sr}")
-    
-    # CRITICAL FIX: Ensure the sample rate used to save matches the processing_sr
-    # This prevents the audio length doubling issue when f0_condition = False
+    # Save the output file
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    torchaudio.save(output_path, vc_wave.cpu(), processing_sr)
+    torchaudio.save(output_path, vc_wave.cpu(), sr)
     
     return {"output_path": output_path, "rtf": rtf}
-    
+
 # Cleanup function to remove temporary files
 def cleanup_temp_files(file_paths):
     for file_path in file_paths:
