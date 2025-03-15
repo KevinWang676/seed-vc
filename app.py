@@ -45,7 +45,6 @@ app.add_middleware(
 # Global variables to store models
 models = None
 device = None
-model_params = None  # Added to store model parameters
 
 # Pydantic models for API requests
 class VoiceConversionRequest(BaseModel):
@@ -73,7 +72,7 @@ def crossfade(chunk1, chunk2, overlap):
 
 # Load models function
 def load_models(f0_condition=False, checkpoint_path=None, config_path=None, fp16=True):
-    global device, model_params, whisper_model  # Added model_params and whisper_model
+    global device
     
     # Set device and enable eager mode to avoid inference tensor issues
     torch._C._jit_set_profiling_executor(False)
@@ -121,7 +120,7 @@ def load_models(f0_condition=False, checkpoint_path=None, config_path=None, fp16
         f0_fn = f0_extractor.infer_from_audio
 
     config = yaml.safe_load(open(dit_config_path, "r"))
-    model_params = recursive_munch(config["model_params"])  # Store model_params globally
+    model_params = recursive_munch(config["model_params"])
     model_params.dit_type = 'DiT'
     model = build_model(model_params, stage="DiT")
     hop_length = config["preprocess_params"]["spect_params"]["hop_length"]
@@ -191,10 +190,8 @@ def load_models(f0_condition=False, checkpoint_path=None, config_path=None, fp16
         raise ValueError(f"Unknown vocoder type: {vocoder_type}")
 
     speech_tokenizer_type = model_params.speech_tokenizer.type
-    
-    # Create a global whisper model for direct access in f0_condition=False case
-    global whisper_model
     if speech_tokenizer_type == 'whisper':
+        # whisper
         from transformers import AutoFeatureExtractor, WhisperModel
         whisper_name = model_params.speech_tokenizer.name
         whisper_model = WhisperModel.from_pretrained(whisper_name, torch_dtype=torch.float16).to(device)
@@ -311,14 +308,14 @@ def load_models(f0_condition=False, checkpoint_path=None, config_path=None, fp16
         mel_fn_args,
     )
 
-# Voice conversion function with fixed handling for f0_condition=False
+# Voice conversion function
 async def process_voice_conversion(source_path, target_path, output_path, params):
-    global models, device, model_params, whisper_model
+    global models, device
     
     if models is None:
         raise ValueError("Models not loaded")
         
-    model, semantic_fn, f0_fn, vocoder_fn, campplus_model, to_mel, mel_fn_args = models
+    model, semantic_fn, f0_fn, vocoder_fn, campplus_model, mel_fn, mel_fn_args = models
     
     # Check that f0_fn is available if f0_condition is True
     if params.f0_condition and f0_fn is None:
@@ -343,7 +340,6 @@ async def process_voice_conversion(source_path, target_path, output_path, params
         print(f"Error loading audio files: {e}")
         raise
 
-    # Set correct sample rate and hop_length based on f0_condition
     sr = 22050 if not f0_condition else 44100
     hop_length = 256 if not f0_condition else 512
     max_context_window = sr // hop_length * 30
@@ -356,116 +352,40 @@ async def process_voice_conversion(source_path, target_path, output_path, params
         ref_audio = torch.tensor(ref_audio[:sr * 25]).unsqueeze(0).float().to(device)
 
     time_vc_start = time.time()
-    
-    # Resample to 16kHz for feature extraction
+    # Resample
     with torch.no_grad():
         converted_waves_16k = torchaudio.functional.resample(source_audio, sr, 16000)
-        ori_waves_16k = torchaudio.functional.resample(ref_audio, sr, 16000)
-    
-    # Extract semantic features
+    # if source audio less than 30 seconds, whisper can handle in one forward
     with torch.no_grad():
-        # For f0_condition=False, use direct whisper processing
-        if not f0_condition and hasattr(model_params.speech_tokenizer, 'type') and model_params.speech_tokenizer.type == 'whisper':
-            # Get whisper feature extractor
-            from transformers import AutoFeatureExtractor
-            whisper_name = model_params.speech_tokenizer.name if hasattr(model_params.speech_tokenizer, 'name') else "openai/whisper-small"
-            whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(whisper_name)
-            
-            # Process source audio
-            if converted_waves_16k.size(-1) <= 16000 * 30:
-                alt_inputs = whisper_feature_extractor([converted_waves_16k.squeeze(0).cpu().numpy()],
-                                                    return_tensors="pt",
-                                                    return_attention_mask=True,
-                                                    sampling_rate=16000)
-                alt_input_features = whisper_model._mask_input_features(
-                    alt_inputs.input_features, attention_mask=alt_inputs.attention_mask).to(device)
-                alt_outputs = whisper_model.encoder(
-                    alt_input_features.to(whisper_model.encoder.dtype),
-                    head_mask=None,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                    return_dict=True,
-                )
-                S_alt = alt_outputs.last_hidden_state.to(torch.float32)
-                S_alt = S_alt[:, :converted_waves_16k.size(-1) // 320 + 1]
-            else:
-                overlapping_time = 5  # 5 seconds
-                S_alt_list = []
-                buffer = None
-                traversed_time = 0
-                while traversed_time < converted_waves_16k.size(-1):
-                    if buffer is None:  # first chunk
-                        chunk = converted_waves_16k[:, traversed_time:traversed_time + 16000 * 30]
-                    else:
-                        chunk = torch.cat([buffer, converted_waves_16k[:, traversed_time:traversed_time + 16000 * (30 - overlapping_time)]], dim=-1)
-                    alt_inputs = whisper_feature_extractor([chunk.squeeze(0).cpu().numpy()],
-                                                        return_tensors="pt",
-                                                        return_attention_mask=True,
-                                                        sampling_rate=16000)
-                    alt_input_features = whisper_model._mask_input_features(
-                        alt_inputs.input_features, attention_mask=alt_inputs.attention_mask).to(device)
-                    alt_outputs = whisper_model.encoder(
-                        alt_input_features.to(whisper_model.encoder.dtype),
-                        head_mask=None,
-                        output_attentions=False,
-                        output_hidden_states=False,
-                        return_dict=True,
-                    )
-                    S_chunk = alt_outputs.last_hidden_state.to(torch.float32)
-                    S_chunk = S_chunk[:, :chunk.size(-1) // 320 + 1]
-                    if traversed_time == 0:
-                        S_alt_list.append(S_chunk)
-                    else:
-                        S_alt_list.append(S_chunk[:, 50 * overlapping_time:])
-                    buffer = chunk[:, -16000 * overlapping_time:]
-                    traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
-                S_alt = torch.cat(S_alt_list, dim=1)
-                
-            # Process target audio
-            ori_inputs = whisper_feature_extractor([ori_waves_16k.squeeze(0).cpu().numpy()],
-                                                return_tensors="pt",
-                                                return_attention_mask=True)
-            ori_input_features = whisper_model._mask_input_features(
-                ori_inputs.input_features, attention_mask=ori_inputs.attention_mask).to(device)
-            ori_outputs = whisper_model.encoder(
-                ori_input_features.to(whisper_model.encoder.dtype),
-                head_mask=None,
-                output_attentions=False,
-                output_hidden_states=False,
-                return_dict=True,
-            )
-            S_ori = ori_outputs.last_hidden_state.to(torch.float32)
-            S_ori = S_ori[:, :ori_waves_16k.size(-1) // 320 + 1]
+        if converted_waves_16k.size(-1) <= 16000 * 30:
+            S_alt = semantic_fn(converted_waves_16k)
         else:
-            # Use semantic_fn for f0_condition=True or other models
-            if converted_waves_16k.size(-1) <= 16000 * 30:
-                S_alt = semantic_fn(converted_waves_16k)
-            else:
-                overlapping_time = 5  # 5 seconds
-                S_alt_list = []
-                buffer = None
-                traversed_time = 0
-                while traversed_time < converted_waves_16k.size(-1):
-                    if buffer is None:  # first chunk
-                        chunk = converted_waves_16k[:, traversed_time:traversed_time + 16000 * 30]
-                    else:
-                        chunk = torch.cat(
-                            [buffer, converted_waves_16k[:, traversed_time:traversed_time + 16000 * (30 - overlapping_time)]],
-                            dim=-1)
-                    S_chunk = semantic_fn(chunk)
-                    if traversed_time == 0:
-                        S_alt_list.append(S_chunk)
-                    else:
-                        S_alt_list.append(S_chunk[:, 50 * overlapping_time:])
-                    buffer = chunk[:, -16000 * overlapping_time:]
-                    traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
-                S_alt = torch.cat(S_alt_list, dim=1)
+            overlapping_time = 5  # 5 seconds
+            S_alt_list = []
+            buffer = None
+            traversed_time = 0
+            while traversed_time < converted_waves_16k.size(-1):
+                if buffer is None:  # first chunk
+                    chunk = converted_waves_16k[:, traversed_time:traversed_time + 16000 * 30]
+                else:
+                    chunk = torch.cat(
+                        [buffer, converted_waves_16k[:, traversed_time:traversed_time + 16000 * (30 - overlapping_time)]],
+                        dim=-1)
+                S_alt_chunk = semantic_fn(chunk)
+                if traversed_time == 0:
+                    S_alt_list.append(S_alt_chunk)
+                else:
+                    S_alt_list.append(S_alt_chunk[:, 50 * overlapping_time:])
+                buffer = chunk[:, -16000 * overlapping_time:]
+                traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
+            S_alt = torch.cat(S_alt_list, dim=1)
 
-            S_ori = semantic_fn(ori_waves_16k)
-        
-        # Generate mel spectrograms
-        mel = to_mel(source_audio.to(device).float())
-        mel2 = to_mel(ref_audio.to(device).float())
+        ori_waves_16k = torchaudio.functional.resample(ref_audio, sr, 16000)
+        S_ori = semantic_fn(ori_waves_16k)
+
+    with torch.no_grad():
+        mel = mel_fn(source_audio.to(device).float())
+        mel2 = mel_fn(ref_audio.to(device).float())
 
         target_lengths = torch.LongTensor([int(mel.size(2) * length_adjust)]).to(mel.device)
         target2_lengths = torch.LongTensor([mel2.size(2)]).to(mel2.device)
@@ -477,7 +397,6 @@ async def process_voice_conversion(source_path, target_path, output_path, params
         feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
         style2 = campplus_model(feat2.unsqueeze(0))
 
-    # Extract and process F0 features if f0_condition is True
     if f0_condition:
         with torch.no_grad():
             if f0_fn is None:
@@ -487,13 +406,8 @@ async def process_voice_conversion(source_path, target_path, output_path, params
             F0_ori = f0_fn(ori_waves_16k[0], thred=0.03)
             F0_alt = f0_fn(converted_waves_16k[0], thred=0.03)
 
-            # Handle different device types
-            if device.type == "mps":
-                F0_ori = torch.from_numpy(F0_ori).float().to(device)[None]
-                F0_alt = torch.from_numpy(F0_alt).float().to(device)[None]
-            else:
-                F0_ori = torch.from_numpy(F0_ori).to(device)[None]
-                F0_alt = torch.from_numpy(F0_alt).to(device)[None]
+            F0_ori = torch.from_numpy(F0_ori).to(device)[None]
+            F0_alt = torch.from_numpy(F0_alt).to(device)[None]
 
             voiced_F0_ori = F0_ori[F0_ori > 1]
             voiced_F0_alt = F0_alt[F0_alt > 1]
@@ -544,11 +458,6 @@ async def process_voice_conversion(source_path, target_path, output_path, params
     processed_frames = 0
     generated_wave_chunks = []
     # generate chunk by chunk and stream the output
-    processed_frames = 0
-    generated_wave_chunks = []
-    
-    print(f"Processing audio in chunks, f0_condition={f0_condition}")
-    
     while processed_frames < cond.size(1):
         with torch.no_grad():
             chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
@@ -572,94 +481,31 @@ async def process_voice_conversion(source_path, target_path, output_path, params
                     inference_cfg_rate=inference_cfg_rate
                 )
                 vc_target = vc_target[:, :, mel2.size(-1):]
-                
-                # Different handling based on f0_condition
-                if not f0_condition:
-                    # For f0_condition=False, handle like the reference code
-                    vc_wave = vocoder_fn(vc_target.float())[0]
-                    
-                    # Print shape for debugging
-                    print(f"f0_condition=False, vc_wave shape: {vc_wave.shape}")
-                    
-                    # Process like reference code
-                    if processed_frames == 0:
-                        if is_last_chunk:
-                            # Single chunk case
-                            output_wave = vc_wave.cpu().numpy()
-                            generated_wave_chunks.append(output_wave)
-                            break
-                        # First of multiple chunks
-                        output_wave = vc_wave[:-overlap_wave_len].cpu().numpy()
-                        generated_wave_chunks.append(output_wave)
-                        previous_chunk = vc_wave[-overlap_wave_len:].cpu()
-                    elif is_last_chunk:
-                        # Last chunk
-                        output_wave = crossfade(previous_chunk.numpy(), vc_wave.cpu().numpy(), overlap_wave_len)
-                        generated_wave_chunks.append(output_wave)
-                        break
-                    else:
-                        # Middle chunk
-                        output_wave = crossfade(previous_chunk.numpy(), vc_wave[:-overlap_wave_len].cpu().numpy(), overlap_wave_len)
-                        generated_wave_chunks.append(output_wave)
-                        previous_chunk = vc_wave[-overlap_wave_len:].cpu()
-                else:
-                    # For f0_condition=True, use the original code's approach
-                    vc_wave = vocoder_fn(vc_target.float()).squeeze()
-                    vc_wave = vc_wave[None, :]
-                    
-                    # Print shape for debugging
-                    print(f"f0_condition=True, vc_wave shape: {vc_wave.shape}")
-                    
-                    if processed_frames == 0:
-                        if is_last_chunk:
-                            # Single chunk case
-                            output_wave = vc_wave[0].cpu().numpy()
-                            generated_wave_chunks.append(output_wave)
-                            break
-                        # First of multiple chunks
-                        output_wave = vc_wave[0, :-overlap_wave_len].cpu().numpy()
-                        generated_wave_chunks.append(output_wave)
-                        previous_chunk = vc_wave[0, -overlap_wave_len:].cpu()
-                    elif is_last_chunk:
-                        # Last chunk
-                        output_wave = crossfade(previous_chunk.numpy(), vc_wave[0].cpu().numpy(), overlap_wave_len)
-                        generated_wave_chunks.append(output_wave)
-                        break
-                    else:
-                        # Middle chunk
-                        output_wave = crossfade(previous_chunk.numpy(), vc_wave[0, :-overlap_wave_len].cpu().numpy(), overlap_wave_len)
-                        generated_wave_chunks.append(output_wave)
-                        previous_chunk = vc_wave[0, -overlap_wave_len:].cpu()
-        
-        # Increment processed frames for next chunk
-        processed_frames += vc_target.size(2) - overlap_frame_len
-        print(f"Processed {processed_frames}/{cond.size(1)} frames")
+                vc_wave = vocoder_fn(vc_target.float()).squeeze()
+                vc_wave = vc_wave[None, :]
+        with torch.no_grad():
+            if processed_frames == 0:
+                if is_last_chunk:
+                    output_wave = vc_wave[0].cpu().numpy()
+                    generated_wave_chunks.append(output_wave)
+                    break
+                output_wave = vc_wave[0, :-overlap_wave_len].cpu().numpy()
+                generated_wave_chunks.append(output_wave)
+                previous_chunk = vc_wave[0, -overlap_wave_len:].cpu()
+                processed_frames += vc_target.size(2) - overlap_frame_len
+            elif is_last_chunk:
+                output_wave = crossfade(previous_chunk.numpy(), vc_wave[0].cpu().numpy(), overlap_wave_len)
+                generated_wave_chunks.append(output_wave)
+                processed_frames += vc_target.size(2) - overlap_frame_len
+                break
+            else:
+                output_wave = crossfade(previous_chunk.numpy(), vc_wave[0, :-overlap_wave_len].cpu().numpy(),
+                                    overlap_wave_len)
+                generated_wave_chunks.append(output_wave)
+                previous_chunk = vc_wave[0, -overlap_wave_len:].cpu()
+                processed_frames += vc_target.size(2) - overlap_frame_len
     
-    # Concatenate waves and convert to tensor
-    # Concatenate waves 
-    concatenated_audio = np.concatenate(generated_wave_chunks)
-    
-    # Ensure proper dimensionality for saving - torchaudio requires [channels, samples]
-    # Check shape of concatenated audio
-    print(f"Shape of concatenated audio: {concatenated_audio.shape}")
-    
-    if len(concatenated_audio.shape) == 1:
-        # If 1D (samples only), add channel dimension
-        vc_wave = torch.tensor(concatenated_audio).unsqueeze(0).float()
-    elif len(concatenated_audio.shape) == 2:
-        # If already 2D, ensure it's [channels, samples] not [samples, channels]
-        if concatenated_audio.shape[0] < concatenated_audio.shape[1]:  # More samples than channels
-            vc_wave = torch.tensor(concatenated_audio).float()
-        else:  # Possibly transposed
-            vc_wave = torch.tensor(concatenated_audio.T).float()
-    else:
-        # If more dimensions, reshape appropriately
-        print(f"Warning: Unexpected audio shape: {concatenated_audio.shape}, reshaping")
-        # Try to flatten to [1, samples]
-        vc_wave = torch.tensor(concatenated_audio.reshape(-1)).unsqueeze(0).float()
-    
-    print(f"Final tensor shape for saving: {vc_wave.shape}")
-    
+    vc_wave = torch.tensor(np.concatenate(generated_wave_chunks))[None, :].float()
     time_vc_end = time.time()
     rtf = (time_vc_end - time_vc_start) / vc_wave.size(-1) * sr
     
@@ -669,7 +515,7 @@ async def process_voice_conversion(source_path, target_path, output_path, params
         
     # Save the output file
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    torchaudio.save(output_path, vc_wave, sr)
+    torchaudio.save(output_path, vc_wave.cpu(), sr)
     
     return {"output_path": output_path, "rtf": rtf}
 
@@ -776,7 +622,7 @@ async def convert_voice_raw(
 @app.on_event("startup")
 async def startup_event():
     """Load models on startup with both f0_condition options"""
-    global models, model_params, whisper_model
+    global models
     print("Loading models...")
     try:
         # Load models with f0_condition=True for singing voice conversion
