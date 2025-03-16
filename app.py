@@ -345,7 +345,11 @@ def voice_conversion_api(source, target, diffusion_steps, length_adjust, inferen
     
     # Concatenate all audio chunks
     final_audio = np.concatenate(generated_wave_chunks)
-    
+
+    # Clean up GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+            
     return sample_rate, final_audio
 
 # FastAPI endpoints
